@@ -51,22 +51,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate Docker image settings
+      - name: Debug Docker Secrets
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
         run: |
+          echo "Username length: ${#DOCKER_USERNAME}"
+          echo "Password length: ${#DOCKER_PASSWORD}"
+          echo "Image name: $IMAGE_NAME"
+
           if [ -z "$DOCKER_USERNAME" ]; then
-            echo "DOCKER_USERNAME secret is missing."
+            echo "DOCKER_USERNAME is missing"
+            exit 1
+          fi
+
+          if [ -z "$DOCKER_PASSWORD" ]; then
+            echo "DOCKER_PASSWORD is missing"
             exit 1
           fi
 
           if [ -z "$IMAGE_NAME" ]; then
-            echo "IMAGE_NAME secret is missing."
+            echo "IMAGE_NAME is missing"
             exit 1
           fi
-
-          echo "Docker image settings are configured."
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -107,6 +115,7 @@ jobs:
 
       - name: Validate application secrets
         env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
@@ -166,7 +175,7 @@ jobs:
         env:
           IMAGE_PATH: ${{ secrets.DOCKER_USERNAME }}/${{ secrets.IMAGE_NAME }}
 
-          GROQ_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
@@ -181,7 +190,7 @@ jobs:
             --restart unless-stopped \
             --name stapp \
             -p 8501:8501 \
-            -e OPENAI_API_KEY \
+            -e GROQ_API_KEY \
             -e GOOGLE_API_KEY \
             -e TAVILY_API_KEY \
             -e OPENWEATHER_API_KEY \
