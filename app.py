@@ -3,6 +3,7 @@ from backend import (
     get_all_threads,
     get_last_human_message,
     delete_thread,
+    register_thread,
     ingest_rag_document
 )
 
@@ -26,6 +27,28 @@ def generate_thread_id():
     return str(uuid.uuid4())
 
 
+# ========================= Multi-user session isolation =========================
+# Every browser tab gets its own session_id. It's stored in the page's URL
+# query params (not just st.session_state) so a page REFRESH keeps the same
+# session_id -- st.session_state alone would not survive a hard reload.
+# Opening the app fresh (no "sid" in the URL) always creates a brand new,
+# independent session, e.g. a different browser or device.
+def init_session_id():
+    if "session_id" in st.session_state:
+        return st.session_state["session_id"]
+
+    existing_sid = st.query_params.get("sid")
+
+    if existing_sid:
+        session_id = existing_sid
+    else:
+        session_id = str(uuid.uuid4())
+        st.query_params["sid"] = session_id
+
+    st.session_state["session_id"] = session_id
+    return session_id
+
+
 # Add a new thread ID to the conversation list
 def add_thread(thread_id):
 
@@ -35,6 +58,10 @@ def add_thread(thread_id):
         # Insert at the front so the newest conversation is always
         # shown first in the sidebar, like ChatGPT / Claude
         st.session_state["chat_threads"].insert(0, thread_id)
+
+    # Scope this thread to the current browser session so no other
+    # visitor's sidebar or history can ever include it
+    register_thread(thread_id, st.session_state["session_id"])
 
 
 # ========================= Chat title helpers =========================
@@ -260,7 +287,8 @@ def resume_hitl_execution(decision):
     # The same thread ID must be used when resuming
     resume_config = {
         "configurable": {
-            "thread_id": interrupted_thread_id
+            "thread_id": interrupted_thread_id,
+            "session_id": st.session_state["session_id"]
         },
         "metadata": {
             "thread_id": interrupted_thread_id
@@ -307,10 +335,12 @@ def resume_hitl_execution(decision):
                             expanded=True,
                         )
 
-                    # Stream only assistant-generated text
-                    if isinstance(
-                        message_chunk,
-                        AIMessage
+                    # Stream only assistant-generated text that came
+                    # from chat_node itself (see ai_only_stream above
+                    # for why this filter matters)
+                    if (
+                        isinstance(message_chunk, AIMessage)
+                        and metadata.get("langgraph_node") == "chat_node"
                     ):
 
                         if message_chunk.content:
@@ -379,6 +409,11 @@ st.set_page_config(
 st.title("Agentic Chatbot with LangGraph")
 
 
+# Establish this visitor's session_id before anything thread-related,
+# since every thread lookup/creation below is scoped to it
+init_session_id()
+
+
 # Create message_history when the app runs for the first time
 if "message_history" not in st.session_state:
     st.session_state["message_history"] = []
@@ -389,9 +424,10 @@ if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = generate_thread_id()
 
 
-# Create a list for storing all conversation thread IDs
+# Create a list for storing all conversation thread IDs, scoped to this
+# visitor's session only -- never another visitor's conversations
 if "chat_threads" not in st.session_state:
-    st.session_state["chat_threads"] = get_all_threads()
+    st.session_state["chat_threads"] = get_all_threads(st.session_state["session_id"])
 
 
 # ========================= HITL ADDED =========================
@@ -475,8 +511,27 @@ def switch_to_thread(thread_id):
     # into Streamlit's required message format
     temp_messages = []
 
+    # Tracks an image path seen from a generate_image ToolMessage until
+    # the next assistant message, so it can be attached to that message
+    # the same way the live streaming path does (see generated_image_holder
+    # in the main input-handling block below).
+    pending_image_path = None
+
     # Loop through all saved messages
     for message in messages:
+
+        # ToolMessages aren't displayed directly, but a generate_image
+        # result needs to be captured so its image can be re-attached to
+        # the assistant message that follows it.
+        if isinstance(message, ToolMessage):
+
+            if getattr(message, "name", None) == "generate_image":
+                tool_content = message.content or ""
+
+                if tool_content.startswith("IMAGE_FILE::"):
+                    pending_image_path = tool_content.split("IMAGE_FILE::", 1)[1]
+
+            continue
 
         # Check whether the message was sent by the user
         if isinstance(message, HumanMessage):
@@ -486,15 +541,21 @@ def switch_to_thread(thread_id):
         elif isinstance(message, AIMessage):
             role = "assistant"
 
-        # Ignore other message types, such as ToolMessage
+        # Ignore other message types
         else:
             continue
 
         # Convert the LangChain message into a dictionary
-        temp_messages.append({
+        entry = {
             "role": role,
             "content": message.content
-        })
+        }
+
+        if role == "assistant" and pending_image_path:
+            entry["image_path"] = pending_image_path
+            pending_image_path = None
+
+        temp_messages.append(entry)
 
     # Replace the current UI history with the selected conversation
     st.session_state["message_history"] = temp_messages
@@ -552,8 +613,16 @@ for message in st.session_state["message_history"]:
     # Create either a user chat bubble or assistant chat bubble
     with st.chat_message(message["role"]):
 
-        # Display the message content
-        st.text(message["content"])
+        # Display the message content as rendered Markdown (bold text,
+        # tables, lists, etc. from RAG/tool-derived answers need this to
+        # actually render -- st.text() would show raw "**bold**" and
+        # "| pipe | table |" syntax literally instead of formatting it).
+        st.markdown(message["content"])
+
+        # Re-display a previously generated image, if this message has one
+        image_path = message.get("image_path")
+        if image_path and os.path.exists(image_path):
+            st.image(image_path)
 
 
 # ========================= HITL approval interface =========================
@@ -647,50 +716,86 @@ if submission:
         # Store the temporary file path
         temporary_file_path = None
 
-        try:
+        # Read the raw bytes ONCE up front so we can sanity-check them
+        # before doing any real work. Picking a file via Google Drive's
+        # in-browser picker (as opposed to local storage/Downloads) can
+        # hand the browser a truncated or empty file if Drive hasn't
+        # finished streaming it down to the device yet -- the picker UI
+        # still shows the correct filename/size, but the actual bytes
+        # received can be incomplete. Catching that here gives a clear,
+        # specific message instead of a confusing low-level PDF parsing
+        # error (or being misdiagnosed as "this PDF is scanned").
+        raw_pdf_bytes = uploaded_pdf.getvalue()
 
-            # Save the uploaded PDF as a temporary local file
-            with tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=".pdf"
-            ) as temporary_file:
+        # A real PDF is always at least a few hundred bytes, and the
+        # "%PDF-" header must appear somewhere in roughly the first KB
+        # per the PDF spec (some files have a small amount of leading
+        # junk/whitespace before it).
+        looks_like_a_real_pdf = (
+            len(raw_pdf_bytes) >= 1024
+            and b"%PDF-" in raw_pdf_bytes[:1024]
+        )
 
-                temporary_file.write(
-                    uploaded_pdf.getvalue()
-                )
+        if not looks_like_a_real_pdf:
 
-                temporary_file_path = temporary_file.name
-
-            # Call the existing backend RAG ingestion function
-            with st.spinner(
-                f"Processing {uploaded_pdf.name}..."
-            ):
-
-                ingest_rag_document(
-                    temporary_file_path
-                )
-
-            # Display PDF processing confirmation
-            st.toast(
-                f"{uploaded_pdf.name} processed successfully.",
-                icon="✅"
-            )
-
-        except Exception as error:
-
-            # Display PDF processing error
             st.error(
-                f"PDF processing failed: {error}"
+                f"\"{uploaded_pdf.name}\" was received incomplete "
+                f"({len(raw_pdf_bytes)} bytes) and couldn't be processed. "
+                "This usually happens when a file is picked directly from "
+                "Google Drive before it has fully downloaded to the "
+                "device. Try opening the file once in the Drive app first "
+                "(or downloading it), then upload it here again -- or pick "
+                "it from Files/Downloads (local storage) instead, which "
+                "doesn't have this issue."
             )
 
-        finally:
+        else:
 
-            # Delete the temporary PDF after indexing
-            if (
-                temporary_file_path
-                and os.path.exists(temporary_file_path)
-            ):
-                os.remove(temporary_file_path)
+            try:
+
+                # Save the uploaded PDF as a temporary local file
+                with tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix=".pdf"
+                ) as temporary_file:
+
+                    temporary_file.write(raw_pdf_bytes)
+
+                    temporary_file_path = temporary_file.name
+
+                # Call the existing backend RAG ingestion function
+                with st.spinner(
+                    f"Processing {uploaded_pdf.name}..."
+                ):
+
+                    ingest_rag_document(
+                        temporary_file_path,
+                        session_id=st.session_state["session_id"],
+                        thread_id=st.session_state["thread_id"],
+                        filename=uploaded_pdf.name
+                    )
+
+                # Display PDF processing confirmation
+                st.toast(
+                    f"{uploaded_pdf.name} processed successfully.",
+                    icon="✅"
+                )
+
+            except Exception as error:
+
+                # Display PDF processing error
+                st.error(
+                    f"PDF processing failed: {error}"
+                )
+
+            finally:
+
+                # Delete the temporary PDF after indexing
+                if (
+                    temporary_file_path
+                    and os.path.exists(temporary_file_path)
+                ):
+                    os.remove(temporary_file_path)
 
 
 # Run this block after the user submits a text message
@@ -708,13 +813,14 @@ if user_input:
 
     # Display the user's message in the chat interface
     with st.chat_message("user"):
-        st.text(user_input)
+        st.markdown(user_input)
 
-    # Pass the current thread ID to LangGraph
-    # LangGraph uses this ID to save and retrieve conversation memory
+    # Pass the current thread ID (for memory) and session ID (for
+    # per-user document scoping in rag_tool) to LangGraph
     CONFIG = {
         "configurable": {
-            "thread_id": st.session_state["thread_id"]
+            "thread_id": st.session_state["thread_id"],
+            "session_id": st.session_state["session_id"]
         },
         "metadata": {
             "thread_id": st.session_state["thread_id"]
@@ -730,52 +836,119 @@ if user_input:
             "box": None
         }
 
+        # Captures the file path of an image produced by the
+        # generate_image tool during this turn, if any, so it can be
+        # rendered with st.image() after streaming finishes (the actual
+        # image bytes never pass through the LLM's own generated text --
+        # see the "IMAGE_FILE::" sentinel handling below).
+        generated_image_holder = {
+            "path": None
+        }
+
         def ai_only_stream():
 
-            for message_chunk, metadata in chatbot.stream(
-                {
-                    "messages": [
-                        HumanMessage(content=user_input)
-                    ]
-                },
-                config=CONFIG,
-                stream_mode="messages",
-            ):
+            # Tracks whether chat_node actually produced any streamed
+            # text. If the guardrail blocks a message, chat_node never
+            # runs, so nothing gets streamed here at all -- the fallback
+            # below then surfaces the refusal message instead of leaving
+            # a blank response.
+            yielded_any_content = False
 
-                # Lazily create & update the SAME status container
-                # when any tool runs
-                if isinstance(
-                    message_chunk,
-                    ToolMessage
+            try:
+                for message_chunk, metadata in chatbot.stream(
+                    {
+                        "messages": [
+                            HumanMessage(content=user_input)
+                        ]
+                    },
+                    config=CONFIG,
+                    stream_mode="messages",
                 ):
 
-                    tool_name = getattr(
+                    # Lazily create & update the SAME status container
+                    # when any tool runs
+                    if isinstance(
                         message_chunk,
-                        "name",
-                        "tool"
-                    )
+                        ToolMessage
+                    ):
 
-                    if status_holder["box"] is None:
-
-                        status_holder["box"] = st.status(
-                            f"🔧 Using `{tool_name}` …",
-                            expanded=True
+                        tool_name = getattr(
+                            message_chunk,
+                            "name",
+                            "tool"
                         )
 
-                    else:
+                        # generate_image returns a sentinel string
+                        # ("IMAGE_FILE::<path>") rather than a URL/base64
+                        # blob, so the LLM never has to reproduce the raw
+                        # image data in its final answer. Capture the path
+                        # here so it can be rendered directly with
+                        # st.image() once streaming finishes.
+                        if tool_name == "generate_image":
 
-                        status_holder["box"].update(
-                            label=f"🔧 Using `{tool_name}` …",
-                            state="running",
-                            expanded=True,
-                        )
+                            tool_content = message_chunk.content or ""
 
-                # Stream ONLY assistant tokens
-                if isinstance(
-                    message_chunk,
-                    AIMessage
-                ):
-                    yield message_chunk.content
+                            if tool_content.startswith("IMAGE_FILE::"):
+                                generated_image_holder["path"] = (
+                                    tool_content.split("IMAGE_FILE::", 1)[1]
+                                )
+
+                        if status_holder["box"] is None:
+
+                            status_holder["box"] = st.status(
+                                f"🔧 Using `{tool_name}` …",
+                                expanded=True
+                            )
+
+                        else:
+
+                            status_holder["box"].update(
+                                label=f"🔧 Using `{tool_name}` …",
+                                state="running",
+                                expanded=True,
+                            )
+
+                    # Stream ONLY assistant tokens that came from
+                    # chat_node itself. Without this "langgraph_node"
+                    # check, the guardrail's internal security classifier
+                    # call (which also invokes the LLM, inside
+                    # guardrail_node) would leak its raw "CATEGORY: ...
+                    # CONFIDENCE: ..." verdict into the visible response,
+                    # since stream_mode="messages" surfaces tokens from
+                    # ANY chat model call made anywhere in the graph run.
+                    if (
+                        isinstance(message_chunk, AIMessage)
+                        and metadata.get("langgraph_node") == "chat_node"
+                    ):
+                        yielded_any_content = True
+                        yield message_chunk.content
+
+            except Exception:
+                # Last line of defense: chat_node already retries and
+                # falls back internally, but if anything else in the
+                # graph (a tool call, the streaming layer itself, etc.)
+                # still raises, show a normal chat message instead of a
+                # raw traceback that crashes the whole app.
+                yield (
+                    "Sorry, something went wrong while generating a "
+                    "response. Please try again, or rephrase your question."
+                )
+                return
+
+            # The guardrail blocked this message before chat_node ever
+            # ran, so nothing was streamed above. Pull the refusal that
+            # guardrail_node saved to the checkpoint and show that instead
+            # of leaving a blank assistant bubble.
+            if not yielded_any_content:
+
+                final_state = chatbot.get_state(config=CONFIG)
+                final_messages = final_state.values.get("messages", [])
+
+                if final_messages and isinstance(final_messages[-1], AIMessage):
+                    fallback_content = final_messages[-1].content
+
+                    if fallback_content:
+                        yield fallback_content
 
             # ========================= HITL ADDED =========================
 
@@ -807,6 +980,11 @@ if user_input:
             ai_only_stream()
         )
 
+        # Display the generated image (if this turn produced one) right
+        # after the text answer, in the same assistant bubble.
+        if generated_image_holder["path"] and os.path.exists(generated_image_holder["path"]):
+            st.image(generated_image_holder["path"])
+
         # Finalize only if a tool was actually used
         if status_holder["box"] is not None:
 
@@ -832,7 +1010,8 @@ if user_input:
     # Save the complete assistant response in Streamlit session state
     st.session_state["message_history"].append({
         "role": "assistant",
-        "content": ai_message
+        "content": ai_message,
+        "image_path": generated_image_holder["path"]
     })
 
     # ========================= HITL ADDED =========================
