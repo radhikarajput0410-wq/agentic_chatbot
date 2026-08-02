@@ -1,89 +1,57 @@
-# Agentic-Chatbot-APP-CICD-Deployment-with-Github-Actions-on-AWS
+#  Agentic Chatbot App
 
-### Description: About the deployment
-
-	1. Build docker image of the source code
-
-	2. Push your docker image to docker hub
-
-	3. Launch Your EC2 
-
-	4. Pull Your image from docker hub in EC2
-
-	5. Lauch your docker image in EC2
-
-## 1. Login to AWS console.
-
-## 2. Create IAM user for deployment
-
-	#Policy:
-
-	1. AmazonEC2FullAccess
-
-	
-
-## 3. Create EC2 machine (Ubuntu) 
-
-## 4. Open EC2 and Install docker in EC2 Machine:
-	
-	
-	#optinal
-
-	sudo apt-get update -y
-
-	sudo apt-get upgrade
-	
-	#Install Docker
-
-	curl -fsSL https://get.docker.com -o get-docker.sh
-
-	sudo sh get-docker.sh
-
-	sudo usermod -aG docker ubuntu
-
-	newgrp docker
-
-
-### Note: Do the port mapping to this port:- 8501
-	
-# 5. Configure EC2 as self-hosted runner:
-
-    setting>actions>runner>new self hosted runner> choose os> then run command one by one
+An AI-powered Agentic Chatbot built with LangGraph, LangChain, and Streamlit, featuring an automated CI/CD pipeline using GitHub Actions, Docker, Docker Hub, and AWS EC2.
 
 
 
+##  Features
+
+-  Agentic AI workflow using LangGraph
+-  Interactive Streamlit interface
+-  Web search integration with Tavily
+-  Weather information support
+-  Dockerized application
+-  Automated CI/CD with GitHub Actions
+-  Self-hosted deployment on AWS EC2
 
 
 
-# 6. How to add secret keys to GitHub Actions:
+## Tech Stack
+
+- Python
+- Streamlit
+- LangChain
+- LangGraph
+- Docker
+- GitHub Actions
+- AWS EC2
+- Docker Hub
 
 
-REGISTRY=docker.io
 
-DOCKER_USERNAME=your-dockerhub-username
+## Project Structure
 
-DOCKER_PASSWORD=your-dockerhub-access-token
 
-IMAGE_NAME=agentic-chatbot
+.
+├── app.py
+├── requirements.txt
+├── Dockerfile
+├── .github/
+│   └── workflows/
+├── src/
+└── README.md
 
-AWS_ACCESS_KEY_ID=your-aws-access-key
+ ##  CI/CD Deployment
 
-AWS_SECRET_ACCESS_KEY=your-aws-secret-key
+The deployment pipeline is fully automated using GitHub Actions.
 
-AWS_REGION=us-east-1
+Workflow:
 
-OPENAI_API_KEY=your-openai-api-key
+1. Push code to GitHub.
+2. GitHub Actions builds the Docker image.
+3. Pushes the image to Docker Hub.
+4. AWS EC2 (self-hosted runner) pulls the latest image.
+5. The application is redeployed automatically.
 
-TAVILY_API_KEY=your-tavily-api-key
 
-OPENWEATHER_API_KEY=your-openweather-api-key
 
-GOOGLE_API_KEY=your-google-api-key
-
-LANGSMITH_TRACING=true
-
-LANGSMITH_ENDPOINT=https://api.smith.langchain.com
-
-LANGSMITH_API_KEY=your-langsmith-api-key
-
-LANGSMITH_PROJECT=agentic-chatbot-project
