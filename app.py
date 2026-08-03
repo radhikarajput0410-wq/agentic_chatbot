@@ -15,11 +15,16 @@ from langchain_core.messages import (
 )
 
 from langgraph.types import Command
+from streamlit_cookies_controller import CookieController
 
 import streamlit as st
 import uuid
 import tempfile
 import os
+
+
+# Single cookie controller instance for the whole app
+cookies = CookieController()
 
 
 # Generate a unique thread ID for each new conversation
@@ -28,22 +33,38 @@ def generate_thread_id():
 
 
 # ========================= Multi-user session isolation =========================
-# Every browser tab gets its own session_id. It's stored in the page's URL
-# query params (not just st.session_state) so a page REFRESH keeps the same
-# session_id -- st.session_state alone would not survive a hard reload.
-# Opening the app fresh (no "sid" in the URL) always creates a brand new,
-# independent session, e.g. a different browser or device.
+# Every browser gets its own session_id, stored in an httpOnly-style browser
+# cookie (via streamlit-cookies-controller) rather than the page's URL query
+# params. Cookies are NOT included when a user copies/shares the page URL
+# with someone else, which is what fixes the "sharing my link gives them my
+# chat history" bug -- a URL-based sid is visible/copyable and was being
+# adopted by anyone who opened the shared link.
+#
+# A cookie DOES survive a page refresh in the same browser, so this keeps
+# the "refresh keeps my session" behavior that query params used to provide,
+# without leaking identity through the URL.
+#
+# Opening the app in a different browser / incognito window / device always
+# creates a brand new, independent session_id, since there's no cookie yet.
 def init_session_id():
     if "session_id" in st.session_state:
         return st.session_state["session_id"]
 
-    existing_sid = st.query_params.get("sid")
+    existing_sid = cookies.get("sid")
 
     if existing_sid:
         session_id = existing_sid
     else:
         session_id = str(uuid.uuid4())
-        st.query_params["sid"] = session_id
+        cookies.set("sid", session_id)
+
+        # Force a rerun so the cookie write is confirmed/available before
+        # the rest of the script relies on st.session_state["session_id"].
+        # Without this, streamlit-cookies-controller's async component can
+        # occasionally not have the cookie round-tripped back to Python
+        # yet on the very next read.
+        st.session_state["session_id"] = session_id
+        st.rerun()
 
     st.session_state["session_id"] = session_id
     return session_id
