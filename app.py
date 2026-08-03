@@ -26,6 +26,11 @@ import os
 # Single cookie controller instance for the whole app
 cookies = CookieController()
 
+# Cookie lives for ~1 year so a returning visitor (same browser, even
+# after closing and reopening it) keeps their history -- not just
+# across in-tab refreshes.
+_SESSION_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365
+
 
 # Generate a unique thread ID for each new conversation
 def generate_thread_id():
@@ -40,23 +45,50 @@ def generate_thread_id():
 # chat history" bug -- a URL-based sid is visible/copyable and was being
 # adopted by anyone who opened the shared link.
 #
-# A cookie DOES survive a page refresh in the same browser, so this keeps
-# the "refresh keeps my session" behavior that query params used to provide,
-# without leaking identity through the URL.
+# A cookie DOES survive a page refresh (and browser restart, given the
+# max_age set below) in the same browser, so this keeps the "refresh keeps
+# my session" behavior without leaking identity through the URL.
 #
 # Opening the app in a different browser / incognito window / device always
-# creates a brand new, independent session_id, since there's no cookie yet.
+# creates a brand new, independent session_id, since there's no cookie yet
+# -- so no visitor can ever see another visitor's conversations.
 def init_session_id():
     if "session_id" in st.session_state:
         return st.session_state["session_id"]
 
-    existing_sid = cookies.get("sid")
+    # getAll() is what actually forces the round-trip to the browser.
+    # On the very first script run after a hard refresh, the
+    # streamlit-cookies-controller component hasn't mounted/synced yet,
+    # so this returns None -- NOT an empty cookie jar. Treating that
+    # None as "no sid cookie exists" was the actual bug: it caused a
+    # brand-new session_id to be generated and persisted right here,
+    # instantly orphaning every thread that was registered under the
+    # real (pre-refresh) session_id -- which is why the sidebar looked
+    # wiped after every refresh.
+    #
+    # st.stop() halts this run without deciding anything yet.
+    # Streamlit's component protocol automatically triggers a fresh
+    # rerun once the frontend actually delivers the cookie jar -- on
+    # that rerun, getAll() will be a real (possibly empty) dict.
+    all_cookies = cookies.getAll()
+
+    if all_cookies is None:
+        st.stop()
+
+    existing_sid = all_cookies.get("sid")
 
     if existing_sid:
         session_id = existing_sid
     else:
+        # Only reached once we KNOW the browser genuinely has no "sid"
+        # cookie -- a new visitor, not just a not-yet-synced one.
         session_id = str(uuid.uuid4())
-        cookies.set("sid", session_id)
+
+        cookies.set(
+            "sid",
+            session_id,
+            max_age=_SESSION_COOKIE_MAX_AGE_SECONDS,
+        )
 
         # Force a rerun so the cookie write is confirmed/available before
         # the rest of the script relies on st.session_state["session_id"].
