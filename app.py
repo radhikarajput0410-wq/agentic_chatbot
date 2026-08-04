@@ -27,8 +27,15 @@ import time
 # Cookie lifetime: 1 year. Without max_age the controller may write a
 # short-lived / session cookie that is easy to lose across refreshes.
 COOKIE_MAX_AGE_SECONDS = 365 * 24 * 60 * 60
-COOKIE_STATE_KEY = "cookies"
+# Streamlit widget / session_state key used by CookieController.
+# Must not be written to manually after CookieController() is created.
+COOKIE_STATE_KEY = "chatterbox_cookies"
 COOKIE_READY_ATTEMPTS = 5
+
+# One CookieController per script run. Creating it twice in the same run
+# raises: st.session_state.<key> cannot be modified after the widget with
+# key <key> is instantiated.
+_cookie_controller = None
 
 
 # Generate a unique thread ID for each new conversation
@@ -37,18 +44,33 @@ def generate_thread_id():
 
 
 # ========================= Cookie helpers =========================
-# streamlit-cookies-controller talks to the browser via a custom
-# component. On the first script run after a load/refresh that component
-# often returns None (not {}), and CookieController then writes that None
-# into st.session_state["cookies"]. On the next run it reuses the cached
-# None, so cookies.get("sid") does `if name not in None` and raises:
-#   TypeError: argument of type 'NoneType' is not iterable
+# streamlit-cookies-controller mounts a custom component and mirrors the
+# result into st.session_state[COOKIE_STATE_KEY].
 #
-# These helpers always purge a poisoned None cache, wait until the
-# component returns a real dict, and only then read/write cookies.
-def _purge_poisoned_cookie_cache():
-    if COOKIE_STATE_KEY in st.session_state and st.session_state[COOKIE_STATE_KEY] is None:
+# Two failure modes we guard against:
+# 1) First hydration returns None -> cookies.get() crashes with TypeError.
+# 2) Calling CookieController() more than once per run -> StreamlitAPIException
+#    because session_state[key] is locked after the widget is instantiated.
+#
+# Rule: construct CookieController exactly once per run; never delete or
+# assign session_state[COOKIE_STATE_KEY] after that construction.
+def _get_cookie_controller():
+    """Return the single CookieController for this script run."""
+    global _cookie_controller
+
+    if _cookie_controller is not None:
+        return _cookie_controller
+
+    # Safe ONLY before the widget exists: drop a poisoned None left by a
+    # previous run so the component remounts instead of reusing None.
+    if (
+        COOKIE_STATE_KEY in st.session_state
+        and st.session_state[COOKIE_STATE_KEY] is None
+    ):
         del st.session_state[COOKIE_STATE_KEY]
+
+    _cookie_controller = CookieController(key=COOKIE_STATE_KEY)
+    return _cookie_controller
 
 
 def cookie_store():
@@ -56,14 +78,8 @@ def cookie_store():
     Return the hydrated cookie dict, or None if the browser component
     has not finished loading yet.
     """
-    _purge_poisoned_cookie_cache()
-    controller = CookieController(key=COOKIE_STATE_KEY)
-    data = controller.getAll()
+    data = _get_cookie_controller().getAll()
     if not isinstance(data, dict):
-        # Critical: CookieController caches None into session_state.
-        # Remove it immediately so the next run remounts the component
-        # instead of permanently reusing None (which causes TypeError).
-        _purge_poisoned_cookie_cache()
         return None
     return data
 
@@ -85,8 +101,7 @@ def wait_for_cookies():
         st.rerun()
 
     # Component never hydrated — continue without durable cookies rather
-    # than crash. Do NOT write {} into session_state['cookies'] here:
-    # that would skip remounting the frontend component on later runs.
+    # than crash. Do not touch session_state[COOKIE_STATE_KEY].
     st.session_state["_cookies_unavailable"] = True
     return {}
 
@@ -104,14 +119,14 @@ def safe_cookie_set(name, value, max_age=COOKIE_MAX_AGE_SECONDS):
     if st.session_state.get("_cookies_unavailable"):
         return False
 
-    wait_for_cookies()
+    data = wait_for_cookies()
     if st.session_state.get("_cookies_unavailable"):
         return False
+    if not isinstance(data, dict):
+        return False
 
-    _purge_poisoned_cookie_cache()
-    controller = CookieController(key=COOKIE_STATE_KEY)
+    controller = _get_cookie_controller()
     if not isinstance(controller.getAll(), dict):
-        _purge_poisoned_cookie_cache()
         return False
 
     controller.set(name, value, max_age=max_age)
@@ -124,13 +139,15 @@ def safe_cookie_remove(name):
     data = cookie_store()
     if data is None or name not in data:
         return
-    controller = CookieController(key=COOKIE_STATE_KEY)
+
+    controller = _get_cookie_controller()
     if not isinstance(controller.getAll(), dict):
         return
+
     try:
         controller.remove(name)
     except Exception:
-        safe_cookie_set(name, "", max_age=0)
+        controller.set(name, "", max_age=0)
 
 
 # ========================= Multi-user session isolation =========================
@@ -159,8 +176,14 @@ def init_session_id():
         return existing_sid
 
     session_id = str(uuid.uuid4())
-    safe_cookie_set("sid", session_id, max_age=COOKIE_MAX_AGE_SECONDS)
-    time.sleep(0.2)
+
+    # Reuse the already-created controller — do not construct another one.
+    if not st.session_state.get("_cookies_unavailable"):
+        controller = _get_cookie_controller()
+        if isinstance(controller.getAll(), dict):
+            controller.set("sid", session_id, max_age=COOKIE_MAX_AGE_SECONDS)
+            time.sleep(0.2)
+
     st.session_state["session_id"] = session_id
     st.session_state.pop("_cookie_ready_attempts", None)
     st.rerun()
