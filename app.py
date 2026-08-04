@@ -21,9 +21,18 @@ import streamlit as st
 import uuid
 import tempfile
 import os
+import time
 
 
-# Single cookie controller instance for the whole app
+# Cookie lifetime: 1 year. Without max_age the controller may write a
+# short-lived / session cookie that is easy to lose across refreshes.
+COOKIE_MAX_AGE_SECONDS = 365 * 24 * 60 * 60
+
+
+# Single cookie controller instance for the whole app.
+# Instantiated during each script run (app.py is re-executed), not in an
+# imported helper module -- a process-wide singleton can leak cookies
+# across Streamlit sessions.
 cookies = CookieController()
 
 
@@ -33,16 +42,17 @@ def generate_thread_id():
 
 
 # ========================= Multi-user session isolation =========================
-# Every browser gets its own session_id, stored in an httpOnly-style browser
-# cookie (via streamlit-cookies-controller) rather than the page's URL query
-# params. Cookies are NOT included when a user copies/shares the page URL
-# with someone else, which is what fixes the "sharing my link gives them my
-# chat history" bug -- a URL-based sid is visible/copyable and was being
-# adopted by anyone who opened the shared link.
+# Every browser gets its own session_id, stored in a browser cookie (via
+# streamlit-cookies-controller) rather than the page's URL query params.
+# Cookies are NOT included when a user copies/shares the page URL, which
+# fixes the "sharing my link gives them my chat history" bug.
 #
-# A cookie DOES survive a page refresh in the same browser, so this keeps
-# the "refresh keeps my session" behavior that query params used to provide,
-# without leaking identity through the URL.
+# CookieController hydrates asynchronously from the browser. On a hard
+# refresh, the first script run often sees cookies.get("sid") == None even
+# when the cookie exists. Minting a new sid in that window orphans every
+# prior conversation for this visitor -- which is exactly the "refresh
+# wipes my history" bug. We therefore wait one rerun before creating a
+# brand-new session_id.
 #
 # Opening the app in a different browser / incognito window / device always
 # creates a brand new, independent session_id, since there's no cookie yet.
@@ -53,21 +63,54 @@ def init_session_id():
     existing_sid = cookies.get("sid")
 
     if existing_sid:
-        session_id = existing_sid
-    else:
-        session_id = str(uuid.uuid4())
-        cookies.set("sid", session_id)
+        st.session_state["session_id"] = existing_sid
+        return existing_sid
 
-        # Force a rerun so the cookie write is confirmed/available before
-        # the rest of the script relies on st.session_state["session_id"].
-        # Without this, streamlit-cookies-controller's async component can
-        # occasionally not have the cookie round-tripped back to Python
-        # yet on the very next read.
-        st.session_state["session_id"] = session_id
+    # First pass after a refresh: cookie may not be readable yet. Wait one
+    # rerun so CookieController can finish hydrating before we mint a new id.
+    if not st.session_state.get("_sid_cookie_waited"):
+        st.session_state["_sid_cookie_waited"] = True
+        time.sleep(0.25)
         st.rerun()
 
+    # Second pass: re-check after hydration. Still missing => new visitor.
+    existing_sid = cookies.get("sid")
+    if existing_sid:
+        st.session_state["session_id"] = existing_sid
+        return existing_sid
+
+    session_id = str(uuid.uuid4())
+    cookies.set("sid", session_id, max_age=COOKIE_MAX_AGE_SECONDS)
+    time.sleep(0.25)
     st.session_state["session_id"] = session_id
-    return session_id
+    st.rerun()
+
+
+def remember_active_thread(thread_id):
+    """Persist which conversation was open so a refresh can reopen it."""
+    if not thread_id:
+        return
+    cookies.set(
+        "last_thread",
+        thread_id,
+        max_age=COOKIE_MAX_AGE_SECONDS,
+    )
+
+
+def resolve_thread_to_restore(chat_threads):
+    """
+    Pick which conversation to show after a refresh.
+    Prefer the last_thread cookie when it still belongs to this session;
+    otherwise fall back to the most recently active thread.
+    """
+    if not chat_threads:
+        return None
+
+    last_thread = cookies.get("last_thread")
+    if last_thread and last_thread in chat_threads:
+        return last_thread
+
+    return chat_threads[0]
 
 
 # Add a new thread ID to the conversation list
@@ -83,7 +126,7 @@ def add_thread(thread_id):
     # Scope this thread to the current browser session so no other
     # visitor's sidebar or history can ever include it
     register_thread(thread_id, st.session_state["session_id"])
-
+    remember_active_thread(thread_id)
 
 # ========================= Chat title helpers =========================
 
@@ -144,6 +187,14 @@ def remove_thread(thread_id):
 
     st.session_state.get("thread_titles", {}).pop(thread_id, None)
 
+    # Drop the last_thread cookie if it pointed at the deleted chat,
+    # otherwise a refresh would try to reopen a gone thread_id.
+    if cookies.get("last_thread") == thread_id:
+        try:
+            cookies.remove("last_thread")
+        except Exception:
+            cookies.set("last_thread", "", max_age=0)
+
 
 # Create a completely new chat conversation
 def reset_chat():
@@ -178,6 +229,51 @@ def load_conversation(thread_id):
     # Return saved messages
     # Return an empty list if no messages are available
     return state.values.get("messages", [])
+
+
+def langchain_messages_to_ui(messages):
+    """
+    Convert LangGraph/LangChain checkpoint messages into the dict format
+    used by Streamlit's chat UI (role/content + optional image_path).
+    """
+
+    temp_messages = []
+    pending_image_path = None
+
+    for message in messages:
+
+        # ToolMessages aren't displayed directly, but a generate_image
+        # result needs to be captured so its image can be re-attached to
+        # the assistant message that follows it.
+        if isinstance(message, ToolMessage):
+
+            if getattr(message, "name", None) == "generate_image":
+                tool_content = message.content or ""
+
+                if tool_content.startswith("IMAGE_FILE::"):
+                    pending_image_path = tool_content.split("IMAGE_FILE::", 1)[1]
+
+            continue
+
+        if isinstance(message, HumanMessage):
+            role = "user"
+        elif isinstance(message, AIMessage):
+            role = "assistant"
+        else:
+            continue
+
+        entry = {
+            "role": role,
+            "content": message.content
+        }
+
+        if role == "assistant" and pending_image_path:
+            entry["image_path"] = pending_image_path
+            pending_image_path = None
+
+        temp_messages.append(entry)
+
+    return temp_messages
 
 
 # ========================= HITL helper functions =========================
@@ -435,22 +531,6 @@ st.title("CHATTERBOX")
 init_session_id()
 
 
-# Create message_history when the app runs for the first time
-if "message_history" not in st.session_state:
-    st.session_state["message_history"] = []
-
-
-# Create a thread ID when the app runs for the first time
-if "thread_id" not in st.session_state:
-    st.session_state["thread_id"] = generate_thread_id()
-
-
-# Create a list for storing all conversation thread IDs, scoped to this
-# visitor's session only -- never another visitor's conversations
-if "chat_threads" not in st.session_state:
-    st.session_state["chat_threads"] = get_all_threads(st.session_state["session_id"])
-
-
 # ========================= HITL ADDED =========================
 
 # Store the currently pending human approval request
@@ -458,6 +538,34 @@ if "pending_hitl" not in st.session_state:
     st.session_state["pending_hitl"] = None
 
 # =============================================================
+
+
+# On a hard browser refresh, Streamlit session_state is empty but the
+# SQLite checkpointer + thread_sessions table still hold every prior
+# conversation for this session_id. Reload the sidebar list and reopen
+# the last (or most recent) chat instead of starting a blank New Chat.
+if "chat_threads" not in st.session_state:
+    st.session_state["chat_threads"] = get_all_threads(
+        st.session_state["session_id"]
+    )
+
+if "thread_id" not in st.session_state:
+    restored_thread_id = resolve_thread_to_restore(
+        st.session_state["chat_threads"]
+    )
+
+    if restored_thread_id:
+        st.session_state["thread_id"] = restored_thread_id
+        st.session_state["message_history"] = langchain_messages_to_ui(
+            load_conversation(restored_thread_id)
+        )
+        remember_active_thread(restored_thread_id)
+    else:
+        st.session_state["thread_id"] = generate_thread_id()
+        st.session_state["message_history"] = []
+
+if "message_history" not in st.session_state:
+    st.session_state["message_history"] = []
 
 
 # Add the current thread to the conversation list
@@ -524,62 +632,12 @@ def switch_to_thread(thread_id):
 
     # Set the selected thread as the current thread
     st.session_state["thread_id"] = thread_id
-
-    # Load the messages saved under the selected thread
-    messages = load_conversation(thread_id)
-
-    # Temporary list for converting LangChain messages
-    # into Streamlit's required message format
-    temp_messages = []
-
-    # Tracks an image path seen from a generate_image ToolMessage until
-    # the next assistant message, so it can be attached to that message
-    # the same way the live streaming path does (see generated_image_holder
-    # in the main input-handling block below).
-    pending_image_path = None
-
-    # Loop through all saved messages
-    for message in messages:
-
-        # ToolMessages aren't displayed directly, but a generate_image
-        # result needs to be captured so its image can be re-attached to
-        # the assistant message that follows it.
-        if isinstance(message, ToolMessage):
-
-            if getattr(message, "name", None) == "generate_image":
-                tool_content = message.content or ""
-
-                if tool_content.startswith("IMAGE_FILE::"):
-                    pending_image_path = tool_content.split("IMAGE_FILE::", 1)[1]
-
-            continue
-
-        # Check whether the message was sent by the user
-        if isinstance(message, HumanMessage):
-            role = "user"
-
-        # Check whether the message was sent by the AI
-        elif isinstance(message, AIMessage):
-            role = "assistant"
-
-        # Ignore other message types
-        else:
-            continue
-
-        # Convert the LangChain message into a dictionary
-        entry = {
-            "role": role,
-            "content": message.content
-        }
-
-        if role == "assistant" and pending_image_path:
-            entry["image_path"] = pending_image_path
-            pending_image_path = None
-
-        temp_messages.append(entry)
+    remember_active_thread(thread_id)
 
     # Replace the current UI history with the selected conversation
-    st.session_state["message_history"] = temp_messages
+    st.session_state["message_history"] = langchain_messages_to_ui(
+        load_conversation(thread_id)
+    )
 
     # ========================= HITL ADDED =========================
 
