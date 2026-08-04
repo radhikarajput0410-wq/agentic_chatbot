@@ -34,9 +34,26 @@ def generate_thread_id():
     return str(uuid.uuid4())
 
 
-def init_session_id():
-    if "session_id" in st.session_state:
-        return st.session_state["session_id"]
+def init_session_and_thread():
+    """
+    Restore BOTH the visitor's identity (session_id) and the exact
+    conversation they had open (thread_id) from cookies in a single
+    round-trip.
+
+    Why thread_id needs its own cookie too: st.session_state is wiped
+    completely on a hard browser refresh -- only cookies survive that.
+    Previously only session_id was cookied, so on every refresh
+    thread_id fell back to `generate_thread_id()` and silently pointed
+    the UI at a brand-new, empty conversation. The old conversation was
+    never actually deleted (it's still in the sidebar), but the active
+    chat window looked wiped -- that was the actual bug. Storing the
+    active thread_id in its own cookie (kept in sync every time the
+    user starts a new chat or switches conversations -- see
+    reset_chat/switch_to_thread) fixes that: a refresh now reopens the
+    exact conversation the user was just looking at.
+    """
+    if "session_id" in st.session_state and "thread_id" in st.session_state:
+        return st.session_state["session_id"], st.session_state["thread_id"]
 
     all_cookies = cookies.getAll()
 
@@ -44,23 +61,51 @@ def init_session_id():
         st.stop()
 
     existing_sid = all_cookies.get("sid")
+    existing_tid = all_cookies.get("tid")
 
-    if existing_sid:
-        session_id = existing_sid
-    else:
-        session_id = str(uuid.uuid4())
+    session_id = existing_sid or str(uuid.uuid4())
+    thread_id = existing_tid or generate_thread_id()
 
+    needs_rerun = False
+
+    if not existing_sid:
         cookies.set(
             "sid",
             session_id,
             max_age=_SESSION_COOKIE_MAX_AGE_SECONDS,
         )
+        needs_rerun = True
 
-        st.session_state["session_id"] = session_id
-        st.rerun()
+    if not existing_tid:
+        cookies.set(
+            "tid",
+            thread_id,
+            max_age=_SESSION_COOKIE_MAX_AGE_SECONDS,
+        )
+        needs_rerun = True
 
     st.session_state["session_id"] = session_id
-    return session_id
+    st.session_state["thread_id"] = thread_id
+
+    if needs_rerun:
+        # Force a rerun so both cookie writes are confirmed/available
+        # before the rest of the script relies on them.
+        st.rerun()
+
+    return session_id, thread_id
+
+
+def set_current_thread_cookie(thread_id):
+    """
+    Keep the "tid" cookie in sync with whichever conversation is
+    currently active, so a refresh always restores THIS conversation,
+    not whatever was active when the cookie was first written.
+    """
+    cookies.set(
+        "tid",
+        thread_id,
+        max_age=_SESSION_COOKIE_MAX_AGE_SECONDS,
+    )
 
 
 def add_thread(thread_id):
@@ -175,6 +220,10 @@ def reset_chat():
 
     st.session_state["thread_id"] = generate_thread_id()
 
+    # Keep the "tid" cookie in sync so a refresh reopens THIS new
+    # chat, not the previous one.
+    set_current_thread_cookie(st.session_state["thread_id"])
+
     st.session_state["message_history"] = []
 
     st.session_state["pending_hitl"] = None
@@ -194,6 +243,57 @@ def load_conversation(thread_id):
     )
 
     return state.values.get("messages", [])
+
+
+def _convert_messages_for_display(messages):
+    """
+    Convert LangChain messages (as stored in the LangGraph checkpoint)
+    into the plain dict format the Streamlit UI renders. Shared by
+    switch_to_thread() (clicking a sidebar conversation) AND the
+    startup/refresh path -- a refresh needs exactly the same
+    reconstruction, not just an empty message_history. Defined here
+    (before it's first used at module level, right after
+    load_conversation) rather than down by switch_to_thread, since
+    Streamlit executes this file top-to-bottom as a script every rerun.
+    """
+
+    temp_messages = []
+
+    pending_image_path = None
+
+    for message in messages:
+
+        if isinstance(message, ToolMessage):
+
+            if getattr(message, "name", None) == "generate_image":
+                tool_content = message.content or ""
+
+                if tool_content.startswith("IMAGE_FILE::"):
+                    pending_image_path = tool_content.split("IMAGE_FILE::", 1)[1]
+
+            continue
+
+        if isinstance(message, HumanMessage):
+            role = "user"
+
+        elif isinstance(message, AIMessage):
+            role = "assistant"
+
+        else:
+            continue
+
+        entry = {
+            "role": role,
+            "content": message.content
+        }
+
+        if role == "assistant" and pending_image_path:
+            entry["image_path"] = pending_image_path
+            pending_image_path = None
+
+        temp_messages.append(entry)
+
+    return temp_messages
 
 
 # ========================= HITL helper functions =========================
@@ -403,15 +503,19 @@ st.set_page_config(
 st.title("CHATTERBOX")
 
 
-init_session_id()
+init_session_and_thread()
 
 
 if "message_history" not in st.session_state:
-    st.session_state["message_history"] = []
-
-
-if "thread_id" not in st.session_state:
-    st.session_state["thread_id"] = generate_thread_id()
+    # Reload this thread's actual saved messages from the LangGraph
+    # checkpointer -- NOT an empty list. thread_id at this point is
+    # either a restored one (from the "tid" cookie, meaning it may
+    # already have messages) or a genuinely new one (load_conversation
+    # simply returns [] for that case). Either way this is what
+    # actually makes chat history survive a refresh.
+    st.session_state["message_history"] = _convert_messages_for_display(
+        load_conversation(st.session_state["thread_id"])
+    )
 
 
 if "chat_threads" not in st.session_state:
@@ -480,45 +584,13 @@ def switch_to_thread(thread_id):
 
     st.session_state["thread_id"] = thread_id
 
+    # Keep the "tid" cookie in sync so a refresh reopens THIS
+    # conversation, not whichever one was active before the switch.
+    set_current_thread_cookie(thread_id)
+
     messages = load_conversation(thread_id)
 
-    temp_messages = []
-
-    pending_image_path = None
-
-    for message in messages:
-
-        if isinstance(message, ToolMessage):
-
-            if getattr(message, "name", None) == "generate_image":
-                tool_content = message.content or ""
-
-                if tool_content.startswith("IMAGE_FILE::"):
-                    pending_image_path = tool_content.split("IMAGE_FILE::", 1)[1]
-
-            continue
-
-        if isinstance(message, HumanMessage):
-            role = "user"
-
-        elif isinstance(message, AIMessage):
-            role = "assistant"
-
-        else:
-            continue
-
-        entry = {
-            "role": role,
-            "content": message.content
-        }
-
-        if role == "assistant" and pending_image_path:
-            entry["image_path"] = pending_image_path
-            pending_image_path = None
-
-        temp_messages.append(entry)
-
-    st.session_state["message_history"] = temp_messages
+    st.session_state["message_history"] = _convert_messages_for_display(messages)
 
     sync_pending_interrupt(thread_id)
 
