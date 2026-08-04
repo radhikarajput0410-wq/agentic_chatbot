@@ -27,18 +27,110 @@ import time
 # Cookie lifetime: 1 year. Without max_age the controller may write a
 # short-lived / session cookie that is easy to lose across refreshes.
 COOKIE_MAX_AGE_SECONDS = 365 * 24 * 60 * 60
-
-
-# Single cookie controller instance for the whole app.
-# Instantiated during each script run (app.py is re-executed), not in an
-# imported helper module -- a process-wide singleton can leak cookies
-# across Streamlit sessions.
-cookies = CookieController()
+COOKIE_STATE_KEY = "cookies"
+COOKIE_READY_ATTEMPTS = 5
 
 
 # Generate a unique thread ID for each new conversation
 def generate_thread_id():
     return str(uuid.uuid4())
+
+
+# ========================= Cookie helpers =========================
+# streamlit-cookies-controller talks to the browser via a custom
+# component. On the first script run after a load/refresh that component
+# often returns None (not {}), and CookieController then writes that None
+# into st.session_state["cookies"]. On the next run it reuses the cached
+# None, so cookies.get("sid") does `if name not in None` and raises:
+#   TypeError: argument of type 'NoneType' is not iterable
+#
+# These helpers always purge a poisoned None cache, wait until the
+# component returns a real dict, and only then read/write cookies.
+def _purge_poisoned_cookie_cache():
+    if COOKIE_STATE_KEY in st.session_state and st.session_state[COOKIE_STATE_KEY] is None:
+        del st.session_state[COOKIE_STATE_KEY]
+
+
+def cookie_store():
+    """
+    Return the hydrated cookie dict, or None if the browser component
+    has not finished loading yet.
+    """
+    _purge_poisoned_cookie_cache()
+    controller = CookieController(key=COOKIE_STATE_KEY)
+    data = controller.getAll()
+    if not isinstance(data, dict):
+        # Critical: CookieController caches None into session_state.
+        # Remove it immediately so the next run remounts the component
+        # instead of permanently reusing None (which causes TypeError).
+        _purge_poisoned_cookie_cache()
+        return None
+    return data
+
+
+def wait_for_cookies():
+    """
+    Block (via st.rerun) until CookieController has a real dict cache.
+    Returns the cookie dict once ready.
+    """
+    data = cookie_store()
+    if data is not None:
+        st.session_state.pop("_cookie_ready_attempts", None)
+        return data
+
+    attempts = st.session_state.get("_cookie_ready_attempts", 0)
+    if attempts < COOKIE_READY_ATTEMPTS:
+        st.session_state["_cookie_ready_attempts"] = attempts + 1
+        time.sleep(0.2)
+        st.rerun()
+
+    # Component never hydrated — continue without durable cookies rather
+    # than crash. Do NOT write {} into session_state['cookies'] here:
+    # that would skip remounting the frontend component on later runs.
+    st.session_state["_cookies_unavailable"] = True
+    return {}
+
+
+def safe_cookie_get(name):
+    if st.session_state.get("_cookies_unavailable"):
+        return None
+    data = cookie_store()
+    if data is None:
+        return None
+    return data.get(name)
+
+
+def safe_cookie_set(name, value, max_age=COOKIE_MAX_AGE_SECONDS):
+    if st.session_state.get("_cookies_unavailable"):
+        return False
+
+    wait_for_cookies()
+    if st.session_state.get("_cookies_unavailable"):
+        return False
+
+    _purge_poisoned_cookie_cache()
+    controller = CookieController(key=COOKIE_STATE_KEY)
+    if not isinstance(controller.getAll(), dict):
+        _purge_poisoned_cookie_cache()
+        return False
+
+    controller.set(name, value, max_age=max_age)
+    return True
+
+
+def safe_cookie_remove(name):
+    if st.session_state.get("_cookies_unavailable"):
+        return
+    data = cookie_store()
+    if data is None or name not in data:
+        return
+    controller = CookieController(key=COOKIE_STATE_KEY)
+    if not isinstance(controller.getAll(), dict):
+        return
+    try:
+        controller.remove(name)
+    except Exception:
+        safe_cookie_set(name, "", max_age=0)
 
 
 # ========================= Multi-user session isolation =========================
@@ -48,11 +140,8 @@ def generate_thread_id():
 # fixes the "sharing my link gives them my chat history" bug.
 #
 # CookieController hydrates asynchronously from the browser. On a hard
-# refresh, the first script run often sees cookies.get("sid") == None even
-# when the cookie exists. Minting a new sid in that window orphans every
-# prior conversation for this visitor -- which is exactly the "refresh
-# wipes my history" bug. We therefore wait one rerun before creating a
-# brand-new session_id.
+# refresh we MUST wait until the cookie dict exists before minting a new
+# sid -- otherwise we either crash (NoneType) or orphan prior chats.
 #
 # Opening the app in a different browser / incognito window / device always
 # creates a brand new, independent session_id, since there's no cookie yet.
@@ -60,29 +149,20 @@ def init_session_id():
     if "session_id" in st.session_state:
         return st.session_state["session_id"]
 
-    existing_sid = cookies.get("sid")
+    # Wait until the cookie component has hydrated a real dict.
+    cookie_data = wait_for_cookies()
 
+    existing_sid = cookie_data.get("sid")
     if existing_sid:
         st.session_state["session_id"] = existing_sid
-        return existing_sid
-
-    # First pass after a refresh: cookie may not be readable yet. Wait one
-    # rerun so CookieController can finish hydrating before we mint a new id.
-    if not st.session_state.get("_sid_cookie_waited"):
-        st.session_state["_sid_cookie_waited"] = True
-        time.sleep(0.25)
-        st.rerun()
-
-    # Second pass: re-check after hydration. Still missing => new visitor.
-    existing_sid = cookies.get("sid")
-    if existing_sid:
-        st.session_state["session_id"] = existing_sid
+        st.session_state.pop("_cookie_ready_attempts", None)
         return existing_sid
 
     session_id = str(uuid.uuid4())
-    cookies.set("sid", session_id, max_age=COOKIE_MAX_AGE_SECONDS)
-    time.sleep(0.25)
+    safe_cookie_set("sid", session_id, max_age=COOKIE_MAX_AGE_SECONDS)
+    time.sleep(0.2)
     st.session_state["session_id"] = session_id
+    st.session_state.pop("_cookie_ready_attempts", None)
     st.rerun()
 
 
@@ -90,7 +170,7 @@ def remember_active_thread(thread_id):
     """Persist which conversation was open so a refresh can reopen it."""
     if not thread_id:
         return
-    cookies.set(
+    safe_cookie_set(
         "last_thread",
         thread_id,
         max_age=COOKIE_MAX_AGE_SECONDS,
@@ -106,7 +186,7 @@ def resolve_thread_to_restore(chat_threads):
     if not chat_threads:
         return None
 
-    last_thread = cookies.get("last_thread")
+    last_thread = safe_cookie_get("last_thread")
     if last_thread and last_thread in chat_threads:
         return last_thread
 
@@ -189,11 +269,8 @@ def remove_thread(thread_id):
 
     # Drop the last_thread cookie if it pointed at the deleted chat,
     # otherwise a refresh would try to reopen a gone thread_id.
-    if cookies.get("last_thread") == thread_id:
-        try:
-            cookies.remove("last_thread")
-        except Exception:
-            cookies.set("last_thread", "", max_age=0)
+    if safe_cookie_get("last_thread") == thread_id:
+        safe_cookie_remove("last_thread")
 
 
 # Create a completely new chat conversation
