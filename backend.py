@@ -1335,36 +1335,16 @@ checkpoint = SqliteSaver(conn)
 # browser/user owns which thread_id". This table adds that mapping so
 # the sidebar (and any other thread listing) only ever shows threads
 # that belong to the current visitor's session -- never another user's.
-#
-# last_active_at is updated whenever a thread is (re)registered so the
-# sidebar can order conversations even if checkpoint timestamps are
-# missing briefly after a process restart.
 conn.execute(
     """
     CREATE TABLE IF NOT EXISTS thread_sessions (
         thread_id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        last_active_at TEXT
+        created_at TEXT NOT NULL
     )
     """
 )
 conn.commit()
-
-# Migrate older DBs that were created before last_active_at existed
-_thread_session_columns = {
-    row[1]
-    for row in conn.execute("PRAGMA table_info(thread_sessions)").fetchall()
-}
-if "last_active_at" not in _thread_session_columns:
-    conn.execute(
-        "ALTER TABLE thread_sessions ADD COLUMN last_active_at TEXT"
-    )
-    conn.execute(
-        "UPDATE thread_sessions SET last_active_at = created_at "
-        "WHERE last_active_at IS NULL"
-    )
-    conn.commit()
 
 
 
@@ -1462,21 +1442,13 @@ def get_active_document(thread_id):
 def register_thread(thread_id, session_id):
     """
     Associate a conversation thread with the browser session that
-    created it. Call this when a thread_id is first used (or re-opened)
-    so it's scoped to the correct session and bubbled to the top of
-    the sidebar ordering.
+    created it. Call this once, right when a new thread_id is first
+    used, so it's immediately scoped to the correct session.
     """
-    now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        """
-        INSERT INTO thread_sessions (
-            thread_id, session_id, created_at, last_active_at
-        )
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(thread_id) DO UPDATE SET
-            last_active_at = excluded.last_active_at
-        """,
-        (thread_id, session_id, now, now),
+        "INSERT OR IGNORE INTO thread_sessions (thread_id, session_id, created_at) "
+        "VALUES (?, ?, ?)",
+        (thread_id, session_id, datetime.now(timezone.utc).isoformat())
     )
     conn.commit()
 
@@ -1489,24 +1461,6 @@ def _thread_ids_for_session(session_id):
         (session_id,)
     )
     return {row[0] for row in cursor.fetchall()}
-
-
-def _thread_activity_for_session(session_id):
-    """
-    Return {thread_id: last_active_at} for every thread owned by
-    session_id. Used as a durable ordering fallback when checkpoint
-    timestamps are unavailable.
-    """
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT thread_id, COALESCE(last_active_at, created_at, '')
-        FROM thread_sessions
-        WHERE session_id = ?
-        """,
-        (session_id,),
-    )
-    return {row[0]: row[1] for row in cursor.fetchall()}
 
 
 
@@ -1550,40 +1504,30 @@ def get_all_threads(session_id):
     session_id is required and enforced: a thread that isn't registered
     to this session (see register_thread) will never be returned, so one
     visitor can never see another visitor's conversations.
-
-    Prefer threads that have LangGraph checkpoints (real message history).
-    If checkpoint listing is empty for this session, fall back to
-    thread_sessions.last_active_at so a refresh still restores chats.
     """
-    activity_by_thread = _thread_activity_for_session(session_id)
+    owned_thread_ids = _thread_ids_for_session(session_id)
 
-    if not activity_by_thread:
+    if not owned_thread_ids:
         return []
 
-    owned_thread_ids = set(activity_by_thread.keys())
     latest_ts_by_thread = {}
 
     for ckpt in checkpoint.list(None):
-        thread_id = ckpt.config["configurable"]["thread_id"]
+        thread_id = ckpt.config['configurable']['thread_id']
 
         if thread_id not in owned_thread_ids:
             continue
 
-        ts = ckpt.checkpoint.get("ts", "")
+        ts = ckpt.checkpoint.get('ts', '')
 
         if thread_id not in latest_ts_by_thread or ts > latest_ts_by_thread[thread_id]:
             latest_ts_by_thread[thread_id] = ts
 
-    # Real conversations (have checkpoints) win. Fall back to the
-    # ownership table only when checkpoint listing yields nothing for
-    # this session -- that keeps empty "New Chat" stubs out of the
-    # sidebar in the normal case, while still surviving a refresh.
-    scored = latest_ts_by_thread if latest_ts_by_thread else activity_by_thread
-
+    # Sort by most recent checkpoint timestamp, newest first
     sorted_threads = sorted(
-        scored.items(),
+        latest_ts_by_thread.items(),
         key=lambda item: item[1],
-        reverse=True,
+        reverse=True
     )
 
     return [thread_id for thread_id, _ in sorted_threads]

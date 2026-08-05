@@ -15,27 +15,12 @@ from langchain_core.messages import (
 )
 
 from langgraph.types import Command
-from streamlit_cookies_controller import CookieController
 
 import streamlit as st
 import uuid
 import tempfile
 import os
-import time
-
-
-# Cookie lifetime: 1 year. Without max_age the controller may write a
-# short-lived / session cookie that is easy to lose across refreshes.
-COOKIE_MAX_AGE_SECONDS = 365 * 24 * 60 * 60
-# Streamlit widget / session_state key used by CookieController.
-# Must not be written to manually after CookieController() is created.
-COOKIE_STATE_KEY = "chatterbox_cookies"
-COOKIE_READY_ATTEMPTS = 5
-
-# One CookieController per script run. Creating it twice in the same run
-# raises: st.session_state.<key> cannot be modified after the widget with
-# key <key> is instantiated.
-_cookie_controller = None
+from session_persistence import get_persistent_session_id
 
 
 # Generate a unique thread ID for each new conversation
@@ -43,177 +28,44 @@ def generate_thread_id():
     return str(uuid.uuid4())
 
 
-# ========================= Cookie helpers =========================
-# streamlit-cookies-controller mounts a custom component and mirrors the
-# result into st.session_state[COOKIE_STATE_KEY].
-#
-# Two failure modes we guard against:
-# 1) First hydration returns None -> cookies.get() crashes with TypeError.
-# 2) Calling CookieController() more than once per run -> StreamlitAPIException
-#    because session_state[key] is locked after the widget is instantiated.
-#
-# Rule: construct CookieController exactly once per run; never delete or
-# assign session_state[COOKIE_STATE_KEY] after that construction.
-def _get_cookie_controller():
-    """Return the single CookieController for this script run."""
-    global _cookie_controller
-
-    if _cookie_controller is not None:
-        return _cookie_controller
-
-    # Safe ONLY before the widget exists: drop a poisoned None left by a
-    # previous run so the component remounts instead of reusing None.
-    if (
-        COOKIE_STATE_KEY in st.session_state
-        and st.session_state[COOKIE_STATE_KEY] is None
-    ):
-        del st.session_state[COOKIE_STATE_KEY]
-
-    _cookie_controller = CookieController(key=COOKIE_STATE_KEY)
-    return _cookie_controller
-
-
-def cookie_store():
-    """
-    Return the hydrated cookie dict, or None if the browser component
-    has not finished loading yet.
-    """
-    data = _get_cookie_controller().getAll()
-    if not isinstance(data, dict):
-        return None
-    return data
-
-
-def wait_for_cookies():
-    """
-    Block (via st.rerun) until CookieController has a real dict cache.
-    Returns the cookie dict once ready.
-    """
-    data = cookie_store()
-    if data is not None:
-        st.session_state.pop("_cookie_ready_attempts", None)
-        return data
-
-    attempts = st.session_state.get("_cookie_ready_attempts", 0)
-    if attempts < COOKIE_READY_ATTEMPTS:
-        st.session_state["_cookie_ready_attempts"] = attempts + 1
-        time.sleep(0.2)
-        st.rerun()
-
-    # Component never hydrated — continue without durable cookies rather
-    # than crash. Do not touch session_state[COOKIE_STATE_KEY].
-    st.session_state["_cookies_unavailable"] = True
-    return {}
-
-
-def safe_cookie_get(name):
-    if st.session_state.get("_cookies_unavailable"):
-        return None
-    data = cookie_store()
-    if data is None:
-        return None
-    return data.get(name)
-
-
-def safe_cookie_set(name, value, max_age=COOKIE_MAX_AGE_SECONDS):
-    if st.session_state.get("_cookies_unavailable"):
-        return False
-
-    data = wait_for_cookies()
-    if st.session_state.get("_cookies_unavailable"):
-        return False
-    if not isinstance(data, dict):
-        return False
-
-    controller = _get_cookie_controller()
-    if not isinstance(controller.getAll(), dict):
-        return False
-
-    controller.set(name, value, max_age=max_age)
-    return True
-
-
-def safe_cookie_remove(name):
-    if st.session_state.get("_cookies_unavailable"):
-        return
-    data = cookie_store()
-    if data is None or name not in data:
-        return
-
-    controller = _get_cookie_controller()
-    if not isinstance(controller.getAll(), dict):
-        return
-
-    try:
-        controller.remove(name)
-    except Exception:
-        controller.set(name, "", max_age=0)
-
-
 # ========================= Multi-user session isolation =========================
-# Every browser gets its own session_id, stored in a browser cookie (via
-# streamlit-cookies-controller) rather than the page's URL query params.
-# Cookies are NOT included when a user copies/shares the page URL, which
-# fixes the "sharing my link gives them my chat history" bug.
+# Every browser gets its own session_id, persisted in that browser's
+# localStorage -- NOT the URL, and not plain st.session_state alone.
 #
-# CookieController hydrates asynchronously from the browser. On a hard
-# refresh we MUST wait until the cookie dict exists before minting a new
-# sid -- otherwise we either crash (NoneType) or orphan prior chats.
+# Why not the URL (st.query_params): a previous version of this app
+# stored session_id there so it would survive a page refresh, but that
+# made it visible in the address bar -- anyone the URL was shared with
+# inherited the exact same session_id, seeing the original user's
+# threads, PDFs, and chat history. That was a real isolation bug.
 #
-# Opening the app in a different browser / incognito window / device always
-# creates a brand new, independent session_id, since there's no cookie yet.
+# Why not st.session_state alone: it's correctly private (never
+# shareable), but it does NOT survive a hard page refresh -- a refresh
+# opens a brand-new connection, which Streamlit treats as a brand-new
+# session, wiping session_state and losing the sidebar/history.
+#
+# localStorage is the correct middle ground: it lives only in this
+# visitor's own browser profile for this site, survives refreshes, and
+# is never part of a URL or otherwise transmitted -- there's no way to
+# "share" it to another browser/device via a link.
 def init_session_id():
+
+    # Already resolved earlier in THIS script run (or a previous rerun
+    # in the same live connection) -- nothing more to do.
     if "session_id" in st.session_state:
         return st.session_state["session_id"]
 
-    # Wait until the cookie component has hydrated a real dict.
-    cookie_data = wait_for_cookies()
+    persisted_session_id = get_persistent_session_id(key="session_persistence")
 
-    existing_sid = cookie_data.get("sid")
-    if existing_sid:
-        st.session_state["session_id"] = existing_sid
-        st.session_state.pop("_cookie_ready_attempts", None)
-        return existing_sid
+    if persisted_session_id is None:
+        # The component's JS hasn't reported back yet -- this happens
+        # for one brief instant on the very first run of a fresh
+        # connection (e.g. right after a page refresh). Halt this run;
+        # the component reporting its value triggers an automatic rerun,
+        # and this function will return normally on that next pass.
+        st.stop()
 
-    session_id = str(uuid.uuid4())
-
-    # Reuse the already-created controller — do not construct another one.
-    if not st.session_state.get("_cookies_unavailable"):
-        controller = _get_cookie_controller()
-        if isinstance(controller.getAll(), dict):
-            controller.set("sid", session_id, max_age=COOKIE_MAX_AGE_SECONDS)
-            time.sleep(0.2)
-
-    st.session_state["session_id"] = session_id
-    st.session_state.pop("_cookie_ready_attempts", None)
-    st.rerun()
-
-
-def remember_active_thread(thread_id):
-    """Persist which conversation was open so a refresh can reopen it."""
-    if not thread_id:
-        return
-    safe_cookie_set(
-        "last_thread",
-        thread_id,
-        max_age=COOKIE_MAX_AGE_SECONDS,
-    )
-
-
-def resolve_thread_to_restore(chat_threads):
-    """
-    Pick which conversation to show after a refresh.
-    Prefer the last_thread cookie when it still belongs to this session;
-    otherwise fall back to the most recently active thread.
-    """
-    if not chat_threads:
-        return None
-
-    last_thread = safe_cookie_get("last_thread")
-    if last_thread and last_thread in chat_threads:
-        return last_thread
-
-    return chat_threads[0]
+    st.session_state["session_id"] = persisted_session_id
+    return persisted_session_id
 
 
 # Add a new thread ID to the conversation list
@@ -229,7 +81,7 @@ def add_thread(thread_id):
     # Scope this thread to the current browser session so no other
     # visitor's sidebar or history can ever include it
     register_thread(thread_id, st.session_state["session_id"])
-    remember_active_thread(thread_id)
+
 
 # ========================= Chat title helpers =========================
 
@@ -290,11 +142,6 @@ def remove_thread(thread_id):
 
     st.session_state.get("thread_titles", {}).pop(thread_id, None)
 
-    # Drop the last_thread cookie if it pointed at the deleted chat,
-    # otherwise a refresh would try to reopen a gone thread_id.
-    if safe_cookie_get("last_thread") == thread_id:
-        safe_cookie_remove("last_thread")
-
 
 # Create a completely new chat conversation
 def reset_chat():
@@ -329,51 +176,6 @@ def load_conversation(thread_id):
     # Return saved messages
     # Return an empty list if no messages are available
     return state.values.get("messages", [])
-
-
-def langchain_messages_to_ui(messages):
-    """
-    Convert LangGraph/LangChain checkpoint messages into the dict format
-    used by Streamlit's chat UI (role/content + optional image_path).
-    """
-
-    temp_messages = []
-    pending_image_path = None
-
-    for message in messages:
-
-        # ToolMessages aren't displayed directly, but a generate_image
-        # result needs to be captured so its image can be re-attached to
-        # the assistant message that follows it.
-        if isinstance(message, ToolMessage):
-
-            if getattr(message, "name", None) == "generate_image":
-                tool_content = message.content or ""
-
-                if tool_content.startswith("IMAGE_FILE::"):
-                    pending_image_path = tool_content.split("IMAGE_FILE::", 1)[1]
-
-            continue
-
-        if isinstance(message, HumanMessage):
-            role = "user"
-        elif isinstance(message, AIMessage):
-            role = "assistant"
-        else:
-            continue
-
-        entry = {
-            "role": role,
-            "content": message.content
-        }
-
-        if role == "assistant" and pending_image_path:
-            entry["image_path"] = pending_image_path
-            pending_image_path = None
-
-        temp_messages.append(entry)
-
-    return temp_messages
 
 
 # ========================= HITL helper functions =========================
@@ -623,12 +425,28 @@ st.set_page_config(
 )
 
 # Display the main application title
-st.title("CHATTERBOX")
+st.title("Agentic Chatbot with LangGraph")
 
 
 # Establish this visitor's session_id before anything thread-related,
 # since every thread lookup/creation below is scoped to it
 init_session_id()
+
+
+# Create message_history when the app runs for the first time
+if "message_history" not in st.session_state:
+    st.session_state["message_history"] = []
+
+
+# Create a thread ID when the app runs for the first time
+if "thread_id" not in st.session_state:
+    st.session_state["thread_id"] = generate_thread_id()
+
+
+# Create a list for storing all conversation thread IDs, scoped to this
+# visitor's session only -- never another visitor's conversations
+if "chat_threads" not in st.session_state:
+    st.session_state["chat_threads"] = get_all_threads(st.session_state["session_id"])
 
 
 # ========================= HITL ADDED =========================
@@ -638,34 +456,6 @@ if "pending_hitl" not in st.session_state:
     st.session_state["pending_hitl"] = None
 
 # =============================================================
-
-
-# On a hard browser refresh, Streamlit session_state is empty but the
-# SQLite checkpointer + thread_sessions table still hold every prior
-# conversation for this session_id. Reload the sidebar list and reopen
-# the last (or most recent) chat instead of starting a blank New Chat.
-if "chat_threads" not in st.session_state:
-    st.session_state["chat_threads"] = get_all_threads(
-        st.session_state["session_id"]
-    )
-
-if "thread_id" not in st.session_state:
-    restored_thread_id = resolve_thread_to_restore(
-        st.session_state["chat_threads"]
-    )
-
-    if restored_thread_id:
-        st.session_state["thread_id"] = restored_thread_id
-        st.session_state["message_history"] = langchain_messages_to_ui(
-            load_conversation(restored_thread_id)
-        )
-        remember_active_thread(restored_thread_id)
-    else:
-        st.session_state["thread_id"] = generate_thread_id()
-        st.session_state["message_history"] = []
-
-if "message_history" not in st.session_state:
-    st.session_state["message_history"] = []
 
 
 # Add the current thread to the conversation list
@@ -732,12 +522,62 @@ def switch_to_thread(thread_id):
 
     # Set the selected thread as the current thread
     st.session_state["thread_id"] = thread_id
-    remember_active_thread(thread_id)
+
+    # Load the messages saved under the selected thread
+    messages = load_conversation(thread_id)
+
+    # Temporary list for converting LangChain messages
+    # into Streamlit's required message format
+    temp_messages = []
+
+    # Tracks an image path seen from a generate_image ToolMessage until
+    # the next assistant message, so it can be attached to that message
+    # the same way the live streaming path does (see generated_image_holder
+    # in the main input-handling block below).
+    pending_image_path = None
+
+    # Loop through all saved messages
+    for message in messages:
+
+        # ToolMessages aren't displayed directly, but a generate_image
+        # result needs to be captured so its image can be re-attached to
+        # the assistant message that follows it.
+        if isinstance(message, ToolMessage):
+
+            if getattr(message, "name", None) == "generate_image":
+                tool_content = message.content or ""
+
+                if tool_content.startswith("IMAGE_FILE::"):
+                    pending_image_path = tool_content.split("IMAGE_FILE::", 1)[1]
+
+            continue
+
+        # Check whether the message was sent by the user
+        if isinstance(message, HumanMessage):
+            role = "user"
+
+        # Check whether the message was sent by the AI
+        elif isinstance(message, AIMessage):
+            role = "assistant"
+
+        # Ignore other message types
+        else:
+            continue
+
+        # Convert the LangChain message into a dictionary
+        entry = {
+            "role": role,
+            "content": message.content
+        }
+
+        if role == "assistant" and pending_image_path:
+            entry["image_path"] = pending_image_path
+            pending_image_path = None
+
+        temp_messages.append(entry)
 
     # Replace the current UI history with the selected conversation
-    st.session_state["message_history"] = langchain_messages_to_ui(
-        load_conversation(thread_id)
-    )
+    st.session_state["message_history"] = temp_messages
 
     # ========================= HITL ADDED =========================
 
@@ -856,17 +696,111 @@ if current_thread_has_pending_hitl:
             resume_hitl_execution("no")
 
 
+def process_uploaded_pdf(raw_pdf_bytes, filename):
+    """
+    Validate and ingest a PDF's raw bytes from the chat input's file
+    picker. Shows st.error/st.toast feedback.
+    """
+
+    # A real PDF is always at least a few hundred bytes, and the
+    # "%PDF-" header must appear somewhere in roughly the first KB
+    # per the PDF spec (some files have a small amount of leading
+    # junk/whitespace before it).
+    looks_like_a_real_pdf = (
+        len(raw_pdf_bytes) >= 1024
+        and b"%PDF-" in raw_pdf_bytes[:1024]
+    )
+
+    if not looks_like_a_real_pdf:
+
+        if len(raw_pdf_bytes) < 1024:
+            st.error(
+                f"\"{filename}\" was received incomplete "
+                f"({len(raw_pdf_bytes)} bytes) and couldn't be "
+                "processed. This usually happens when a file is "
+                "picked directly from Google Drive before it has "
+                "fully downloaded to the device. Try opening the "
+                "file once in the Drive app first (or downloading "
+                "it), then upload it here again -- or pick it from "
+                "Files/Downloads (local storage) instead, which "
+                "doesn't have this issue."
+            )
+        else:
+            st.error(
+                f"\"{filename}\" doesn't look like a valid "
+                "PDF file. Please upload an actual PDF document."
+            )
+        return
+
+    temporary_file_path = None
+
+    try:
+
+        # Save the uploaded PDF as a temporary local file
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".pdf"
+        ) as temporary_file:
+
+            temporary_file.write(raw_pdf_bytes)
+
+            temporary_file_path = temporary_file.name
+
+        # Call the existing backend RAG ingestion function
+        with st.spinner(
+            f"Processing {filename}..."
+        ):
+
+            ingest_rag_document(
+                temporary_file_path,
+                session_id=st.session_state["session_id"],
+                thread_id=st.session_state["thread_id"],
+                filename=filename
+            )
+
+        # Display PDF processing confirmation
+        st.toast(
+            f"{filename} processed successfully.",
+            icon="✅"
+        )
+
+    except Exception as error:
+
+        # Display PDF processing error
+        st.error(
+            f"PDF processing failed: {error}"
+        )
+
+    finally:
+
+        # Delete the temporary PDF after indexing
+        if (
+            temporary_file_path
+            and os.path.exists(temporary_file_path)
+        ):
+            os.remove(temporary_file_path)
+
+
+
 # ========================= Fixed chat input with PDF upload =========================
 
 # Keep st.chat_input directly in the main body.
 # This keeps it fixed at the bottom of the screen.
 #
 # accept_file=True adds the attachment button inside the chat input.
-# file_type=["pdf"] allows PDF files only.
+#
+# file_type is intentionally NOT set here. Google Drive's mobile picker
+# sometimes hands the browser a file with a generic/incorrect MIME type
+# (e.g. application/octet-stream) even for a perfectly valid PDF --
+# Streamlit's client-side file_type filter then rejects it outright
+# (shown as a red invalid-file icon on the attachment chip) before our
+# code ever runs. Server-side validation below (the "%PDF-" magic-byte
+# check) already enforces "must be a real PDF" with a clear, friendly
+# error message, so it's safe -- and more reliable across devices/picker
+# apps -- to drop the client-side gate and let that check do the job.
 submission = st.chat_input(
     "Type here",
     accept_file=True,
-    file_type=["pdf"],
 
     # Disable input while waiting for human approval
     disabled=current_thread_has_pending_hitl
@@ -892,89 +826,16 @@ if submission:
 
         uploaded_pdf = uploaded_files[0]
 
-        # Store the temporary file path
-        temporary_file_path = None
-
         # Read the raw bytes ONCE up front so we can sanity-check them
         # before doing any real work. Picking a file via Google Drive's
         # in-browser picker (as opposed to local storage/Downloads) can
         # hand the browser a truncated or empty file if Drive hasn't
         # finished streaming it down to the device yet -- the picker UI
         # still shows the correct filename/size, but the actual bytes
-        # received can be incomplete. Catching that here gives a clear,
-        # specific message instead of a confusing low-level PDF parsing
-        # error (or being misdiagnosed as "this PDF is scanned").
-        raw_pdf_bytes = uploaded_pdf.getvalue()
-
-        # A real PDF is always at least a few hundred bytes, and the
-        # "%PDF-" header must appear somewhere in roughly the first KB
-        # per the PDF spec (some files have a small amount of leading
-        # junk/whitespace before it).
-        looks_like_a_real_pdf = (
-            len(raw_pdf_bytes) >= 1024
-            and b"%PDF-" in raw_pdf_bytes[:1024]
-        )
-
-        if not looks_like_a_real_pdf:
-
-            st.error(
-                f"\"{uploaded_pdf.name}\" was received incomplete "
-                f"({len(raw_pdf_bytes)} bytes) and couldn't be processed. "
-                "This usually happens when a file is picked directly from "
-                "Google Drive before it has fully downloaded to the "
-                "device. Try opening the file once in the Drive app first "
-                "(or downloading it), then upload it here again -- or pick "
-                "it from Files/Downloads (local storage) instead, which "
-                "doesn't have this issue."
-            )
-
-        else:
-
-            try:
-
-                # Save the uploaded PDF as a temporary local file
-                with tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix=".pdf"
-                ) as temporary_file:
-
-                    temporary_file.write(raw_pdf_bytes)
-
-                    temporary_file_path = temporary_file.name
-
-                # Call the existing backend RAG ingestion function
-                with st.spinner(
-                    f"Processing {uploaded_pdf.name}..."
-                ):
-
-                    ingest_rag_document(
-                        temporary_file_path,
-                        session_id=st.session_state["session_id"],
-                        thread_id=st.session_state["thread_id"],
-                        filename=uploaded_pdf.name
-                    )
-
-                # Display PDF processing confirmation
-                st.toast(
-                    f"{uploaded_pdf.name} processed successfully.",
-                    icon="✅"
-                )
-
-            except Exception as error:
-
-                # Display PDF processing error
-                st.error(
-                    f"PDF processing failed: {error}"
-                )
-
-            finally:
-
-                # Delete the temporary PDF after indexing
-                if (
-                    temporary_file_path
-                    and os.path.exists(temporary_file_path)
-                ):
-                    os.remove(temporary_file_path)
+        # received can be incomplete. process_uploaded_pdf() catches
+        # that and gives a clear, specific message instead of a
+        # confusing low-level PDF parsing error.
+        process_uploaded_pdf(uploaded_pdf.getvalue(), uploaded_pdf.name)
 
 
 # Run this block after the user submits a text message

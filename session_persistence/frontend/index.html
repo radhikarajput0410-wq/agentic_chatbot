@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+</head>
+<body>
+  <script>
+    // ---------------------------------------------------------------
+    // Minimal Streamlit component protocol (hand-rolled, no build step)
+    // ---------------------------------------------------------------
+    function sendValue(value) {
+      window.parent.postMessage(
+        { isStreamlitMessage: true, type: "streamlit:setComponentValue", value: value },
+        "*"
+      );
+    }
+
+    function setFrameHeight(height) {
+      window.parent.postMessage(
+        { isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: height },
+        "*"
+      );
+    }
+
+    // Tell Streamlit we're ready. This component has no visible UI.
+    window.parent.postMessage(
+      { isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 },
+      "*"
+    );
+    setFrameHeight(0);
+
+    // ---------------------------------------------------------------
+    // Get-or-create the session_id in localStorage
+    // ---------------------------------------------------------------
+    const STORAGE_KEY = "agentic_chatbot_session_id";
+
+    function generateUuidV4() {
+      // Simple RFC4122-ish v4 UUID generator, no external library needed.
+      return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
+        const randomValue = (Math.random() * 16) | 0;
+        const value = c === "x" ? randomValue : (randomValue & 0x3) | 0x8;
+        return value.toString(16);
+      });
+    }
+
+    let sessionId;
+
+    try {
+      sessionId = window.localStorage.getItem(STORAGE_KEY);
+
+      if (!sessionId) {
+        sessionId = generateUuidV4();
+        window.localStorage.setItem(STORAGE_KEY, sessionId);
+      }
+    } catch (error) {
+      // localStorage can be unavailable (private/incognito mode with
+      // strict settings, or a sandboxed iframe). Fall back to a fresh,
+      // non-persistent ID so the app still works -- it just won't
+      // survive a refresh in that specific browser configuration.
+      sessionId = generateUuidV4();
+    }
+
+    sendValue(sessionId);
+  </script>
+</body>
+</html>
