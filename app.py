@@ -425,7 +425,7 @@ st.set_page_config(
 )
 
 # Display the main application title
-st.title("Agentic Chatbot with LangGraph")
+st.title("CHATTERBOX")
 
 
 # Establish this visitor's session_id before anything thread-related,
